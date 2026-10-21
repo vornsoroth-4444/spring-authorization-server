@@ -13,12 +13,14 @@ import org.springframework.http.MediaType;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configuration.OAuth2AuthorizationServerConfiguration;
 import org.springframework.security.core.userdetails.User;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.core.userdetails.UserDetailsService;
 import org.springframework.security.oauth2.core.AuthorizationGrantType;
 import org.springframework.security.oauth2.core.ClientAuthenticationMethod;
 import org.springframework.security.oauth2.core.oidc.OidcScopes;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.server.authorization.client.RegisteredClient;
 import org.springframework.security.oauth2.server.authorization.client.RegisteredClientRepository;
 import org.springframework.security.config.annotation.web.configurers.oauth2.server.authorization.OAuth2AuthorizationServerConfigurer;
@@ -30,6 +32,8 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint;
 import org.springframework.security.web.util.matcher.MediaTypeRequestMatcher;
 
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.interfaces.RSAPrivateKey;
@@ -66,15 +70,19 @@ public class AuthorizationServerConfig {
 
         return http.build();
     }
-    // 2. Default Web Security Filter Chain (Handles user login)
+
+    // 2. Default Web Security Filter Chain (Handles user login and Bearer tokens for API)
     @Bean
     @Order(2)
     public SecurityFilterChain defaultSecurityFilterChain(HttpSecurity http) throws Exception {
         http
+                .csrf((csrf) -> csrf.ignoringRequestMatchers("/api/**"))
                 .authorizeHttpRequests((authorize) -> authorize
                         .requestMatchers("/public-key").permitAll()
+                        .requestMatchers("/api/**").authenticated()
                         .anyRequest().authenticated()
                 )
+                .oauth2ResourceServer((oauth2) -> oauth2.jwt(Customizer.withDefaults()))
                 .formLogin(Customizer.withDefaults());
 
         return http.build();
@@ -126,31 +134,48 @@ public class AuthorizationServerConfig {
         };
     }
 
-    // 5. JWK Signing Key Pair (RSA 2048-bit)
+    // 5. JWK Signing Key Pair (Persistent RSA 2048-bit key)
     @Bean
     public JWKSource<SecurityContext> jwkSource() {
-        KeyPair keyPair = generateRsaKey();
-        RSAPublicKey publicKey = (RSAPublicKey) keyPair.getPublic();
-        RSAPrivateKey privateKey = (RSAPrivateKey) keyPair.getPrivate();
-        RSAKey rsaKey = new RSAKey.Builder(publicKey)
-                .privateKey(privateKey)
-                .keyID(UUID.randomUUID().toString())
-                .build();
+        RSAKey rsaKey = loadRsaKey();
         JWKSet jwkSet = new JWKSet(rsaKey);
         return new ImmutableJWKSet<>(jwkSet);
     }
 
-    private static KeyPair generateRsaKey() {
+    private static RSAKey loadRsaKey() {
+        try (InputStream is = AuthorizationServerConfig.class.getResourceAsStream("/auth-server-key.json")) {
+            if (is != null) {
+                String json = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+                return RSAKey.parse(json);
+            }
+        } catch (Exception ignored) {
+        }
+        return generateRsaKey();
+    }
+
+    private static RSAKey generateRsaKey() {
         try {
             KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
             generator.initialize(2048);
-            return generator.generateKeyPair();
+            KeyPair keyPair = generator.generateKeyPair();
+            RSAPublicKey publicKey = (RSAPublicKey) keyPair.getPublic();
+            RSAPrivateKey privateKey = (RSAPrivateKey) keyPair.getPrivate();
+            return new RSAKey.Builder(publicKey)
+                    .privateKey(privateKey)
+                    .keyID(UUID.randomUUID().toString())
+                    .build();
         } catch (Exception ex) {
             throw new IllegalStateException("Failed to generate RSA key pair", ex);
         }
     }
 
-    // 6. Authorization Server Endpoint Configuration
+    // 6. JWT Decoder (for Resource Server Bearer Token validation)
+    @Bean
+    public JwtDecoder jwtDecoder(JWKSource<SecurityContext> jwkSource) {
+        return OAuth2AuthorizationServerConfiguration.jwtDecoder(jwkSource);
+    }
+
+    // 7. Authorization Server Endpoint Configuration
     @Bean
     public AuthorizationServerSettings authorizationServerSettings() {
         return AuthorizationServerSettings.builder().build();
